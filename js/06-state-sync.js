@@ -582,7 +582,7 @@ function getCardSamplerParams(card) {
     top_k:       card.topK !== undefined ? card.topK : 40,
     top_p:       card.topP !== undefined ? card.topP : 0.95,
     repeat_penalty:  card.repeatPenalty !== undefined ? card.repeatPenalty : 1.1,
-    repeat_last_n:   card.repeatLastN !== undefined ? card.repeatLastN : 64,
+    repeat_last_n:   (card.repeatLastN !== undefined && card.repeatLastN >= 0) ? card.repeatLastN : 64,
     // XTC — off by default
     xtc_probability: card.xtcProbability !== undefined ? card.xtcProbability : 0,
     xtc_threshold:   card.xtcThreshold !== undefined ? card.xtcThreshold : 0.1,
