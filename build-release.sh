@@ -23,6 +23,16 @@ cd "$(dirname "$0")"
 RELEASE="$(tr -d '[:space:]' < VERSION)"
 [ -n "$RELEASE" ] || { echo "ERROR: VERSION file is empty" >&2; exit 1; }
 
+# Checked here rather than at the copy below so the failure names the cause.
+# An archive that silently shipped without it still runs -- it just loses the
+# Add a Model modal the moment the machine is offline, which is a bug report
+# from a user rather than an error from the build.
+[ -f installer/models.ini ] || {
+    echo "ERROR: installer/models.ini is missing" >&2
+    echo "       Run installer/gen-catalog.py launch.bat installer/models.ini first." >&2
+    exit 1
+}
+
 GO="${GO:-go}"
 if ! command -v "$GO" >/dev/null 2>&1; then
     for candidate in "$HOME/Downloads/go/bin/go" /usr/local/go/bin/go; do
@@ -76,6 +86,12 @@ for target in linux/amd64 linux/arm64 windows/amd64 darwin/arm64 darwin/amd64; d
     mkdir -p "$stage"
     cp -r web "$stage/web"
     cp GO_SERVER.md "$stage/README.md"
+
+    # The fallback model catalogue. catalog.Discover() looks beside the binary,
+    # which is exactly where a portable unzip puts it. Without this the Add a
+    # Model modal has nothing to fall back to when the remote catalogue cannot
+    # be reached, and answers 503 on an offline machine.
+    cp installer/models.ini "$stage/models.ini"
 
     CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
         "$GO" build -trimpath -ldflags "$LDFLAGS" -o "$stage/$name" ./cmd/gobbonet

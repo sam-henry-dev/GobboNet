@@ -68,3 +68,8 @@ hardware.ini
 /state.json
 /.gobbonet-secret
 /perf.toml
+
+# installer-linux build artefacts
+installer-linux/vendor/
+installer-linux/stage/
+installer-linux/dist/

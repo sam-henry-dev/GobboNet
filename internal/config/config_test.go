@@ -536,3 +536,68 @@ func TestSetUncommentsDefaultWithoutDuplicating(t *testing.T) {
 		t.Errorf("model_dir = %q", cfg.ModelDir)
 	}
 }
+
+// --- Model catalogue --------------------------------------------------------
+
+// The fetch is on by default, and an absent key must keep it on rather than
+// reading as false. Load seeds from Default() before decoding, which is what
+// makes a plain bool safe here.
+func TestModelCatalogDefaults(t *testing.T) {
+	d := Default()
+	if !d.ModelCatalogRemote {
+		t.Error("the catalogue fetch should default to on")
+	}
+	if d.ModelCatalogURL == "" {
+		t.Error("no default catalogue URL")
+	}
+
+	path := writeConfig(t, "llm_url = \"http://127.0.0.1:11437\"\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.ModelCatalogRemote {
+		t.Error("a config that does not mention the catalogue switched it off")
+	}
+	if cfg.ModelCatalogURL != d.ModelCatalogURL {
+		t.Errorf("url = %q, want the default %q", cfg.ModelCatalogURL, d.ModelCatalogURL)
+	}
+}
+
+// Turning it off has to actually stick — this is a privacy control, and a
+// setting that silently reverts is worse than not offering it.
+func TestModelCatalogCanBeSwitchedOff(t *testing.T) {
+	path := writeConfig(t, "llm_url = \"http://127.0.0.1:11437\"\nmodel_catalog_remote = false\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ModelCatalogRemote {
+		t.Fatal("model_catalog_remote = false did not take effect")
+	}
+}
+
+// `config set` has to handle both keys: the bool must be written unquoted and
+// the URL quoted, or the file stops parsing.
+func TestConfigSetHandlesCatalogKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := WriteDefault(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := Set(path, "model_catalog_remote", "false"); err != nil {
+		t.Fatalf("set model_catalog_remote: %v", err)
+	}
+	if err := Set(path, "model_catalog_url", "https://example.test/list.json"); err != nil {
+		t.Fatalf("set model_catalog_url: %v", err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("the config no longer parses after config set: %v", err)
+	}
+	if cfg.ModelCatalogRemote {
+		t.Error("model_catalog_remote did not round-trip")
+	}
+	if cfg.ModelCatalogURL != "https://example.test/list.json" {
+		t.Errorf("url = %q", cfg.ModelCatalogURL)
+	}
+}

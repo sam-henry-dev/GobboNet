@@ -70,6 +70,45 @@ func (t *tuning) CtxSize() int {
 	return t.current.CtxSize
 }
 
+// setAuto moves the baseline, and puts it in force unless perf.toml is
+// overriding. Zero ctxSize and empty kv mean "no opinion", and leave that field
+// alone.
+//
+// This is the layer a catalogue entry's ctx/kv belongs in. config.toml is what
+// the hardware probe decided for the model being run, perf.toml is what the
+// user asked for instead, and a model's published tuning is the former: it
+// should move the baseline that "reset to automatic" restores, and it must not
+// silently discard a setting the user typed in the panel.
+//
+// GPULayers is deliberately untouched. The catalogue has no opinion on it and
+// the probe's answer is about the card, not the model.
+//
+// Reports whether the values in force changed, so the caller knows whether the
+// supervisor needs telling.
+func (t *tuning) setAuto(ctxSize int, kv string) (supervisor.Tuning, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if ctxSize > 0 {
+		t.auto.CtxSize = ctxSize
+	}
+	if kv != "" {
+		t.auto.KVCacheType = kv
+	}
+	if t.overridden {
+		return t.current, false
+	}
+
+	before := t.current
+	if ctxSize > 0 {
+		t.current.CtxSize = ctxSize
+	}
+	if kv != "" {
+		t.current.KVCacheType = kv
+	}
+	return t.current, t.current != before
+}
+
 // perfTriple is the {ctxSize, gpuLayers, kvCacheType} object upstream sends.
 type perfTriple struct {
 	CtxSize     int    `json:"ctxSize"`

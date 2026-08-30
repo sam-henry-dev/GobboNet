@@ -9,6 +9,7 @@
 //	gobbonet serve --config PATH      serve using a specific config
 //	gobbonet set-password             set or change the access password
 //	gobbonet check                    probe the upstream and report what it says
+//	gobbonet doctor                   report paths, ports and who owns them
 //	gobbonet config get KEY           read one setting (for launcher scripts)
 //	gobbonet config set KEY VALUE     write one setting, comments preserved
 package main
@@ -17,11 +18,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/jmccardle/gobbonet/internal/auth"
 	"github.com/jmccardle/gobbonet/internal/config"
@@ -57,12 +60,69 @@ const minPasswordLength = 6
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
+		// A silent error is a status answer, not a failure to report: the
+		// caller wants the exit code and nothing on the terminal.
+		if _, quiet := err.(errSilent); quiet {
+			os.Exit(1)
+		}
 		fmt.Fprintf(os.Stderr, "\n [ERROR] %v\n", err)
+		// On Windows this process is usually a console window launched from a
+		// shortcut, and that window closes the instant we exit -- so the only
+		// copy of the message above is gone before it can be read. That is how
+		// a fatal server_exe became "it just doesn't start". Leave a copy
+		// somewhere findable, and say where.
+		if logged := recordStartupError(err); logged != "" {
+			fmt.Fprintf(os.Stderr, "\n This was also written to:\n   %s\n", logged)
+			fmt.Fprintf(os.Stderr, "\n For a full report of paths and ports, run:\n   gobbonet doctor\n")
+		}
 		os.Exit(1)
 	}
 }
 
+// recordStartupError appends a fatal error to a log beside the config, and
+// returns where it wrote it (or "" if it could not).
+//
+// Append rather than truncate: someone debugging a start that fails
+// intermittently needs the previous attempts, and this file only ever grows by
+// a few lines per failed launch.
+//
+// Every failure here is swallowed. This runs while reporting another error, and
+// a diagnostic that panics on the way out is worse than no diagnostic.
+func recordStartupError(cause error) string {
+	dir := config.ConfigDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return ""
+	}
+	path := filepath.Join(dir, "startup-error.log")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "%s  gobbonet %s\n  %v\n\n",
+		time.Now().Format(time.RFC3339), version.Full(), cause)
+	return path
+}
+
 func run(argv []string) error {
+	// The global aliases have to be recognised before the serve default is
+	// applied. The switch below lists "-v", "--version", "-h" and "--help" as
+	// commands, but a bare "if it starts with a dash it is a flag" rule meant
+	// they never reached it: `gobbonet --version` was parsed as `serve
+	// --version` and died on an undefined flag, and `gobbonet --help` printed
+	// flag's "Usage of serve:" rather than this program's own usage. Only the
+	// undashed spellings ever worked.
+	if len(argv) == 1 {
+		switch argv[0] {
+		case "-v", "--version":
+			fmt.Println(version.Full())
+			return nil
+		case "-h", "--help":
+			usage()
+			return nil
+		}
+	}
+
 	command := "serve"
 	if len(argv) > 0 && !strings.HasPrefix(argv[0], "-") {
 		command = argv[0]
@@ -74,8 +134,16 @@ func run(argv []string) error {
 		return cmdServe(argv)
 	case "set-password":
 		return cmdSetPassword(argv)
+	case "setup":
+		return cmdSetup(argv)
+	case "uninstall":
+		return cmdUninstall(argv)
+	case "autostart":
+		return cmdAutostart(argv)
 	case "check":
 		return cmdCheck(argv)
+	case "doctor":
+		return cmdDoctor(argv)
 	case "config":
 		return cmdConfig(argv)
 	case "version", "-v", "--version":
@@ -94,8 +162,13 @@ func usage() {
 	fmt.Print(`gobbonet - local AI chat server
 
   gobbonet [serve] [--config PATH] [--no-auth] [--host H] [--port N]
-  gobbonet set-password [--config PATH]
+  gobbonet set-password [--config PATH] [--stdin]
+  gobbonet setup [--config PATH] [--catalog PATH] [--server-exe PATH]
+                 [--no-browser] [--force]
+  gobbonet autostart [--enable] [--disable]
+  gobbonet uninstall [--keep-models] [--remove-models] [--yes]
   gobbonet check [--config PATH]
+  gobbonet doctor [--config PATH]
   gobbonet config get [--config PATH] <key>
   gobbonet config set [--config PATH] <key> <value>
   gobbonet config keys
@@ -134,7 +207,7 @@ func stringFlag(fs *flag.FlagSet, name, usage string) *string {
 // --- serve -----------------------------------------------------------------
 
 func cmdServe(argv []string) error {
-	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs := flag.NewFlagSet("gobbonet serve", flag.ContinueOnError)
 	configPath := stringFlag(fs, "config", "path to config.toml")
 	host := stringFlag(fs, "host", "override listen_host")
 	llmURL := stringFlag(fs, "llm-url", "override llm_url")
@@ -161,6 +234,24 @@ func cmdServe(argv []string) error {
 		cfg.LLMURL = *llmURL
 	}
 	cfg.RequireAuth = !*noAuth
+
+	// A server_exe that names a file which is gone is fatal below -- correctly,
+	// because silently demoting to remote mode proxies into a void. But it is
+	// fatal about a path the user never typed: the installer writes an absolute
+	// one, so reinstalling to a different folder strands it. If the real binary
+	// is sitting next to us, adopt it and write that back, rather than refusing
+	// to start over a value we chose ourselves.
+	if from, healed := cfg.HealServerExe(); healed {
+		fmt.Printf(" [*]  server_exe pointed at a file that is gone:\n        %s\n", from)
+		fmt.Printf("      using the one next to this binary instead:\n        %s\n", cfg.ServerExe)
+		if err := config.Set(cfg.Path, "server_exe", cfg.ServerExe); err != nil {
+			// Not fatal: we can still serve this run with the healed value.
+			// Only the persistence failed, so say so and carry on.
+			fmt.Printf(" [!]  could not save the corrected path to %s: %v\n", cfg.Path, err)
+		} else {
+			fmt.Printf(" [OK] config updated: %s\n", cfg.Path)
+		}
+	}
 
 	// Mode is resolved before anything else starts, because a misconfigured
 	// server_exe must stop the launch rather than silently demote us to remote
@@ -267,6 +358,24 @@ func cmdServe(argv []string) error {
 		return portInUseError(cfg, err)
 	}
 
+	// Record the port we actually bound, beside this binary, where
+	// setup-lan.bat and launch.bat already look for it (%~dp0.gobbonet-port).
+	//
+	// Written AFTER the bind succeeds, so the file always describes a port that
+	// really was served rather than one we hoped for. Nothing used to write it,
+	// so setup-lan.bat fell back to its own default and could open the firewall
+	// and reserve a URL on a port the server never bound -- which shows up as a
+	// 503 on the address the user was told to visit, from HTTP.SYS answering
+	// for an empty reservation, while the server runs fine elsewhere.
+	//
+	// Best effort. On Linux the binary sits in a root-owned directory and this
+	// will fail; that is harmless, because the sidecar exists for the Windows
+	// LAN scripts. A server that is bound and ready must not die over it.
+	if err := config.WritePortFile(cfg.ListenPort); err != nil {
+		fmt.Printf(" [*]  could not write .gobbonet-port (%v)\n", err)
+		fmt.Println("      Harmless unless you use setup-lan.bat, which reads it.")
+	}
+
 	address := cfg.ListenHost
 	if address == "0.0.0.0" || address == "::" {
 		address = server.LANIP()
@@ -348,8 +457,9 @@ func isAddrInUse(err error) bool {
 // --- set-password ----------------------------------------------------------
 
 func cmdSetPassword(argv []string) error {
-	fs := flag.NewFlagSet("set-password", flag.ContinueOnError)
+	fs := flag.NewFlagSet("gobbonet set-password", flag.ContinueOnError)
 	configPath := stringFlag(fs, "config", "path to config.toml")
+	fromStdin := fs.Bool("stdin", false, "read the password from standard input")
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
@@ -358,7 +468,42 @@ func cmdSetPassword(argv []string) error {
 	if err != nil {
 		return err
 	}
+	if *fromStdin {
+		return storePasswordFromStdin(&cfg)
+	}
 	return promptAndStorePassword(&cfg)
+}
+
+// storePasswordFromStdin is the headless door onto the same hashing the
+// interactive prompt uses.
+//
+// The password is read from standard input rather than taken as an argument on
+// purpose. On Linux any process can read any other process's command line out
+// of /proc, so a password passed as a flag is readable machine-wide for as long
+// as the call runs — and lands in the shell history besides. The Windows
+// installer avoids the command line for exactly this reason.
+func storePasswordFromStdin(cfg *config.Config) error {
+	raw, err := io.ReadAll(io.LimitReader(os.Stdin, 4096))
+	if err != nil {
+		return fmt.Errorf("could not read the password from standard input: %w", err)
+	}
+	// One trailing newline is what `echo` and a here-string both add; anything
+	// else the caller typed is theirs to keep.
+	password := strings.TrimRight(string(raw), "\r\n")
+	if len(password) < minPasswordLength {
+		return fmt.Errorf("the password must be at least %d characters", minPasswordLength)
+	}
+
+	secret, err := auth.NewSecret(password)
+	if err != nil {
+		return err
+	}
+	if err := config.Set(cfg.Path, "access_secret", secret); err != nil {
+		return fmt.Errorf("could not save the password to %s: %w", cfg.Path, err)
+	}
+	cfg.AccessSecret = secret
+	fmt.Println("  [OK] Password set.")
+	return nil
 }
 
 // ensurePassword makes sure a usable password exists before the server starts.
@@ -427,7 +572,7 @@ func readPassword(prompt string) (string, error) {
 // --- check -----------------------------------------------------------------
 
 func cmdCheck(argv []string) error {
-	fs := flag.NewFlagSet("check", flag.ContinueOnError)
+	fs := flag.NewFlagSet("gobbonet check", flag.ContinueOnError)
 	configPath := stringFlag(fs, "config", "path to config.toml")
 	if err := fs.Parse(argv); err != nil {
 		return err

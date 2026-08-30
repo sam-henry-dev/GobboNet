@@ -9,6 +9,8 @@
 //	/health-fileserver         liveness, plus what this server is capable of
 //	/active-model.json         model identity for the UI
 //	/models-list.json          the header dropdown
+//	/catalog.json              the download catalogue, for the add-a-model modal
+//	/model-download            start (POST) and poll (GET) a model download
 //	/state, /state/*           cross-device state sync
 //	/perf                      llama-server tuning the settings panel edits
 //	/swap-model, /swap-status  model-swap contract
@@ -31,6 +33,7 @@ import (
 	"time"
 
 	"github.com/jmccardle/gobbonet/internal/auth"
+	"github.com/jmccardle/gobbonet/internal/catalog"
 	"github.com/jmccardle/gobbonet/internal/config"
 	"github.com/jmccardle/gobbonet/internal/httpx"
 	"github.com/jmccardle/gobbonet/internal/jobs"
@@ -64,6 +67,24 @@ type Server struct {
 	// rewrites it in place.
 	secretMu sync.RWMutex
 	secret   string
+
+	// cat is the download catalogue, loaded on first use by catalog(). catErr
+	// caches the failure so a missing models.ini disables the add-a-model modal
+	// rather than being re-stat-ed on every request.
+	//
+	// catForced is when an explicit refresh last bypassed the fetch's own 24
+	// hour disk cache, so that opening the modal repeatedly on a dead network
+	// costs one timeout rather than one per open.
+	catMu     sync.Mutex
+	cat       *catalog.Catalog
+	catErr    error
+	catSource string
+	catNotes  []string
+	catForced time.Time
+	catForce  bool
+
+	// downloads enforces one model download at a time, the wizard's policy.
+	downloads downloads
 
 	upstream upstreamHealth
 }
@@ -197,14 +218,26 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case path == "/models-list.json":
 		httpx.WriteJSON(w, r, http.StatusOK, s.info.ModelsListPayload())
 
+	// The add-a-model modal. Authenticated like everything else in this block —
+	// /model-download writes files to disk and makes outbound requests, and this
+	// server can be bound to the LAN.
+	case path == "/catalog.json":
+		s.handleCatalog(w, r)
+
+	case path == "/model-download":
+		s.handleModelDownload(w, r)
+
 	case path == "/state" || strings.HasPrefix(path, "/state/"):
 		state.Handle(w, r, s.cfg.StatePath())
 
 	case path == "/perf":
 		s.handlePerf(w, r)
 
+	// Wrapped rather than delegated straight through: the model about to be
+	// launched may have a published ctx/kv, and this is the only point at which
+	// we know which model that is. See handleSwapModel in models.go.
 	case path == "/swap-model":
-		supervisor.Handlers{Sup: s.sup}.HandleSwapModel(w, r)
+		s.handleSwapModel(w, r)
 
 	case path == "/swap-status":
 		supervisor.Handlers{Sup: s.sup}.HandleSwapStatus(w, r)

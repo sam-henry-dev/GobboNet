@@ -25,10 +25,13 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/jmccardle/gobbonet/internal/catalog"
 )
 
 // Mode is what the server does about llama.cpp: supervise it, or just proxy to
@@ -131,6 +134,23 @@ type Config struct {
 	// rewritten as Argon2id on the next successful login.
 	AccessSecret string `toml:"access_secret"`
 
+	// --- Model catalogue ----------------------------------------------------
+	// ModelCatalogURL is the published download catalogue. Fetched by this
+	// binary, never by the browser, as a plain GET with no parameters and
+	// nothing identifying — see internal/catalog/fetch.go.
+	//
+	// ModelCatalogRemote switches that fetch off entirely. When false, nothing
+	// is requested and the list comes from the cache or the shipped
+	// models.ini. This is the setting the config panel exposes.
+	//
+	// A plain bool rather than a pointer: Load seeds from Default() before
+	// decoding, so an absent key keeps the default (true) and an explicit
+	// `false` still wins. A *bool would distinguish those too, but it would
+	// break `config set`, whose formatValue quotes anything that is not a
+	// plain Int, Bool or Slice.
+	ModelCatalogURL    string `toml:"model_catalog_url"`
+	ModelCatalogRemote bool   `toml:"model_catalog_remote"`
+
 	// --- Chat template overrides -------------------------------------------
 	ChatTemplateName string `toml:"chat_template_name"`
 	ChatTemplateFile string `toml:"chat_template_file"`
@@ -194,6 +214,13 @@ func Default() Config {
 		JobMaxConcurrent: DefaultJobMaxConcurrent,
 		JobMaxAgeHours:   DefaultJobMaxAgeHours,
 		RequireAuth:      true,
+		// The catalogue fetch is on by default. It is the only thing besides
+		// web search that leaves the machine, it is a plain GET of a static
+		// file with nothing identifying attached, and off by default would
+		// mean most users never see a model added after their install. The
+		// config panel makes it one click to turn off.
+		ModelCatalogURL:    catalog.DefaultURL,
+		ModelCatalogRemote: true,
 	}
 }
 
@@ -515,6 +542,135 @@ func (c *Config) Mode() (Mode, error) {
 		return "", fmt.Errorf("server_exe %q is a directory, not the llama-server binary", c.ServerExe)
 	}
 	return ModeLocal, nil
+}
+
+// serverExeName is the llama.cpp binary's filename on this platform.
+func serverExeName() string {
+	if runtime.GOOS == "windows" {
+		return "llama-server.exe"
+	}
+	return "llama-server"
+}
+
+// HealServerExe repairs a server_exe that names a file which is no longer
+// there, when — and only when — there is an unambiguous replacement sitting
+// beside this binary.
+//
+// Mode() is right to treat a missing server_exe as fatal, but it is fatal about
+// a value the user never typed. The installer writes an ABSOLUTE path
+// ($INSTDIR\llama-cpp\llama-server.exe), so installing to one folder and later
+// reinstalling to another leaves the config pointing at the old one. On Linux
+// the portable tarball has the same shape: unpack to ~/gobbonet-1.6, let the
+// first-run wizard record that path, move the folder, and the config is stale.
+// In both cases the correct binary is right next to the gobbonet that is
+// running, and refusing to start is a worse answer than using it.
+//
+// This deliberately does NOT search widely. It looks where our own installers
+// put the binary and nowhere else, because silently adopting some other
+// llama-server found elsewhere on the machine would be a different program than
+// the user installed. If nothing is found, the caller falls through to Mode()'s
+// fatal error, which is still the right outcome — there is genuinely nothing to
+// run.
+//
+// Returns the old path when it healed, so the caller can say what it changed.
+func (c *Config) HealServerExe() (from string, healed bool) {
+	if c.ServerExe == "" {
+		return "", false
+	}
+	if st, err := os.Stat(c.ServerExe); err == nil && !st.IsDir() {
+		return "", false
+	}
+
+	name := serverExeName()
+	var dirs []string
+	if exe, err := os.Executable(); err == nil {
+		// Resolve symlinks: on Linux the menu entry runs /usr/lib/gobbonet/gobbonet
+		// but a packager may well have put a link in /usr/bin.
+		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+			exe = resolved
+		}
+		dirs = append(dirs, filepath.Dir(exe))
+	}
+	if wd, err := os.Getwd(); err == nil {
+		dirs = append(dirs, wd)
+	}
+
+	for _, dir := range dirs {
+		// llama-cpp/ first: that is where both installers put it. A bare
+		// sibling is the portable-unzip layout.
+		for _, candidate := range []string{
+			filepath.Join(dir, "llama-cpp", name),
+			filepath.Join(dir, name),
+		} {
+			if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
+				old := c.ServerExe
+				c.ServerExe = candidate
+				return old, true
+			}
+		}
+	}
+	return "", false
+}
+
+// ---------------------------------------------------------------------------
+// The port sidecar
+//
+// setup-lan.bat reads the web port from .gobbonet-port in the install
+// directory; the server reads listen_port from config.toml. Nothing wrote the
+// sidecar, and nothing in Go ever read it, so the two could disagree — and when
+// they did, the firewall rule and the URL reservation landed on one port while
+// the server bound another. The visible symptom is a 503 on the port the user
+// was told to visit, from HTTP.SYS answering for a reservation with no listener
+// behind it, while the server runs perfectly somewhere else.
+//
+// The fix is ownership: the process that binds the port is the process that
+// writes the file. There is then only one source of truth, and the scripts read
+// it rather than guess.
+// ---------------------------------------------------------------------------
+
+// PortFilePath is the sidecar's location: beside the running binary, which is
+// the "%~dp0.gobbonet-port" that setup-lan.bat and launch.bat already look at.
+func PortFilePath() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	return filepath.Join(filepath.Dir(exe), ".gobbonet-port")
+}
+
+// WritePortFile records the port actually bound.
+//
+// Best effort on purpose. On Linux the binary lives in /usr/lib/gobbonet, which
+// the user cannot write to, and that is fine: the sidecar exists to feed
+// setup-lan.bat, which is Windows-only. A failure here must never stop a server
+// that is otherwise ready to serve.
+func WritePortFile(port int) error {
+	path := PortFilePath()
+	if path == "" {
+		return errors.New("could not locate the running binary")
+	}
+	return os.WriteFile(path, []byte(strconv.Itoa(port)+"\n"), 0o644)
+}
+
+// ReadPortFile returns the port recorded in the sidecar, or 0.
+func ReadPortFile() int {
+	path := PortFilePath()
+	if path == "" {
+		return 0
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	// Digits only, matching how launch.bat and setup-lan.bat parse it.
+	n, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // ---------------------------------------------------------------------------

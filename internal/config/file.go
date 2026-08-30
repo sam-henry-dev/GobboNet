@@ -57,6 +57,26 @@ llm_url = "http://127.0.0.1:11437"
 search_url = "https://ollama.com/api"
 embed_url = "http://127.0.0.1:11436"
 
+# --- Model catalogue ----------------------------------------------------
+# The list of downloadable models shown by "Add a Model" in the config
+# panel. Keeping it online means models added after your install show up
+# without you reinstalling anything.
+#
+# This is the second and last thing GobboNet fetches from the internet,
+# after web search. What it sends: a plain GET for a static ~5 KB JSON
+# file. No query parameters, no cookies, no identifier, no telemetry, and
+# in particular NOT your hardware -- the whole list is downloaded and
+# filtered on your machine rather than asking a server what fits your GPU.
+# The browser is never involved; this binary does the fetching.
+#
+# The answer is cached for a day, so this is at most one request per day
+# and usually fewer. Set model_catalog_remote = false to switch it off
+# entirely: nothing is requested, and the list comes from the cache or
+# the models.ini that shipped with GobboNet. Downloading a model still
+# works either way.
+model_catalog_remote = true
+model_catalog_url = "https://goblincorps.com/gobbonet_model_list.json"
+
 # API key sent to the upstream llama.cpp server (never exposed to the
 # browser). Set this if your upstream requires authentication.
 # Alternatives, either of which wins over the value below:

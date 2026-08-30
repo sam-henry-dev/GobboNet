@@ -127,7 +127,7 @@ cp -r "$ROOT/web" "$PAYLOAD/web"
 
 # Scripts kept from the Windows lineage. launch.bat still owns adding further
 # models; hardware-probe.ps1 is called by the installer's probe page.
-for f in launch.bat setup-lan.bat hardware-probe.ps1 identify-model.ps1 fileserver.ps1; do
+for f in launch.bat setup-lan.bat teardown-lan.bat stop-gobbonet.bat hardware-probe.ps1 identify-model.ps1 fileserver.ps1; do
     [ -f "$ROOT/$f" ] || { echo "ERROR: $f missing from $ROOT" >&2; exit 1; }
     cp "$ROOT/$f" "$PAYLOAD/$f"
 done

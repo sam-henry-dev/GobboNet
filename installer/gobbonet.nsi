@@ -660,6 +660,26 @@ Section "GobboNet" SecMain
   SetOutPath "$INSTDIR"
   SetOverwrite on
 
+  ; An upgrade over a running install cannot overwrite gobbonet.exe while it
+  ; is running -- NSIS reports a write failure on a file the user can plainly
+  ; see, which reads as a corrupt download. Extracted to $PLUGINSDIR in
+  ; .onInit because on a FIRST install $INSTDIR has no copy yet.
+  DetailPrint "Stopping any running GobboNet..."
+  stop_retry:
+  nsExec::ExecToLog '"$SYSDIR\cmd.exe" /c ""$PLUGINSDIR\stop-gobbonet.bat" /quiet"'
+  Pop $0
+  ${If} $0 != 0
+    ; Say what is wrong while it can still be fixed. Letting the File command
+    ; below hit a locked gobbonet.exe instead produces "could not write to
+    ; file", which names the symptom and not the cause.
+    MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION \
+      "GobboNet is still running and could not be stopped automatically.$\r$\n$\r$\n\
+Close the GobboNet window (and any llama-server window), then choose Retry.$\r$\n$\r$\n\
+If it will not close, a reboot always clears it." \
+      IDRETRY stop_retry
+    Abort "Setup stopped: GobboNet is still running."
+  ${EndIf}
+
   DetailPrint "Installing GobboNet ${VERSION}..."
   File "${PAYLOAD}\gobbonet.exe"
   File "${PAYLOAD}\gobbonet.ico"
@@ -670,9 +690,28 @@ Section "GobboNet" SecMain
   ; (see .onInit) because this section had not executed yet.
   File "${PAYLOAD}\launch.bat"
   File "${PAYLOAD}\setup-lan.bat"
+  ; teardown-lan.bat is the counterpart to setup-lan.bat, and it has to be
+  ; installed even for users who never run the LAN setup: the uninstaller
+  ; calls it, and it is the only thing that clears a URL reservation.
+  File "${PAYLOAD}\teardown-lan.bat"
+  File "${PAYLOAD}\stop-gobbonet.bat"
   File "${PAYLOAD}\hardware-probe.ps1"
   File "${PAYLOAD}\identify-model.ps1"
   File "${PAYLOAD}\fileserver.ps1"
+
+  ; The running server needs this too, not just the installer.
+  ;
+  ; .onInit extracts a copy into $PLUGINSDIR for the model page, and NSIS
+  ; deletes $PLUGINSDIR when the installer exits -- so for three releases
+  ; nothing named models.ini survived the install. catalog.Discover() looks
+  ; beside the exe, found nothing, and the settings panel's Add a Model modal
+  ; had no fallback list when the remote catalogue was unreachable. On Windows
+  ; that meant a 503 and an empty modal.
+  ;
+  ; Compile-time source, the same one ReserveFile names, rather than routing
+  ; through $PAYLOAD: gen-catalog.py writes it into this directory and there is
+  ; no reason for a second staging hop to be able to go stale.
+  File "models.ini"
 
   ; Carry the probe result forward. $PLUGINSDIR is deleted when the
   ; installer exits, and launch.bat reads hardware.json from its own
@@ -769,6 +808,14 @@ arrived instead of the model. Nothing was installed to the models folder."
   ;--------------------------------------------------------------
   DetailPrint "Writing configuration..."
   ${If} $Backend == "remote"
+    ; Clear server_exe FIRST. Choosing remote used to set llm_url and leave a
+    ; server_exe from a previous local install untouched, which meant one of
+    ; two wrong outcomes: the install silently stayed in local mode against a
+    ; stale binary, or -- if that binary was gone -- every start failed fatally
+    ; with an error naming a path this installer wrote and the user never did.
+    ; An empty server_exe IS remote mode, so saying so is the whole fix.
+    !insertmacro RunChecked '"$INSTDIR\gobbonet.exe" config set server_exe ""' \
+                            "Clearing server_exe (remote mode)"
     !insertmacro RunChecked '"$INSTDIR\gobbonet.exe" config set llm_url "$RemoteUrl"' \
                             "Setting llm_url"
     ${If} $RemoteKey != ""
@@ -794,8 +841,18 @@ arrived instead of the model. Nothing was installed to the models folder."
         '"$INSTDIR\gobbonet.exe" config set server_exe "$INSTDIR\llama-cpp\llama-server.exe"' \
         "Setting server_exe"
     ${Else}
-      DetailPrint "  [WARN] llama-server.exe not found in the bundle; leaving"
-      DetailPrint "         server_exe empty. GobboNet will start in remote mode."
+      ; Actually clear it, rather than only saying so.
+      ;
+      ; This branch printed "leaving server_exe empty ... will start in remote
+      ; mode" and then wrote nothing, so on a reinstall the PREVIOUS install's
+      ; server_exe survived. The comment above was right that writing a bad
+      ; value would be worse -- but leaving a bad one is not better, and the
+      ; DetailPrint was a promise the code did not keep. An install with no
+      ; engine in the bundle is a remote install, so make the config say that.
+      !insertmacro RunChecked '"$INSTDIR\gobbonet.exe" config set server_exe ""' \
+                              "Clearing server_exe (no engine bundled)"
+      DetailPrint "  [WARN] llama-server.exe not found in the bundle;"
+      DetailPrint "         server_exe cleared. GobboNet will start in remote mode."
     ${EndIf}
   ${EndIf}
 
@@ -906,6 +963,9 @@ Function .onInit
   ; hardware" branch. Section SecMain still installs its own copy into
   ; $INSTDIR -- launch.bat calls it later, long after $PLUGINSDIR is gone.
   File /oname=$PLUGINSDIR\hardware-probe.ps1 "${PAYLOAD}\hardware-probe.ps1"
+  ; Same reasoning: SecMain runs it before it has installed anything, so it
+  ; cannot come from $INSTDIR on a first install.
+  File /oname=$PLUGINSDIR\stop-gobbonet.bat "${PAYLOAD}\stop-gobbonet.bat"
 
   StrCpy $Backend "local"
   StrCpy $RemoteUrl "http://"
@@ -919,6 +979,100 @@ FunctionEnd
 
 ;===================================================================
 Section "Uninstall"
+  ;--------------------------------------------------------------
+  ; STOP EVERYTHING FIRST.
+  ;
+  ; This section used to go straight to Delete "$INSTDIR\gobbonet.exe" with
+  ; nothing stopped. A running server holds its own binary and the install
+  ; folder open, so the delete fails and Windows says "the folder is still
+  ; open in another program" -- which reads as a stuck uninstall and leaves a
+  ; server still holding the web port after the user believes it is gone.
+  ;--------------------------------------------------------------
+  DetailPrint "Stopping GobboNet..."
+  ${If} ${FileExists} "$INSTDIR\stop-gobbonet.bat"
+    un_stop_retry:
+    nsExec::ExecToLog '"$SYSDIR\cmd.exe" /c ""$INSTDIR\stop-gobbonet.bat" /quiet"'
+    Pop $0
+    ${If} $0 != 0
+      MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION \
+        "GobboNet is still running and could not be stopped automatically.$\r$\n$\r$\n\
+Close it, then choose Retry. Continuing now would leave files behind and \
+report that the folder is still open in another program." \
+        IDRETRY un_stop_retry
+      Abort "Uninstall stopped: GobboNet is still running."
+    ${EndIf}
+  ${Else}
+    ; Upgrading from a build that predates the helper: do the two that matter
+    ; inline. taskkill needs no elevation for this user's own processes.
+    nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM gobbonet.exe'
+    Pop $0
+    nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM llama-server.exe'
+    Pop $0
+  ${EndIf}
+
+  ;--------------------------------------------------------------
+  ; LAN TEARDOWN -- the reason a broken port survives a reinstall.
+  ;
+  ; setup-lan.bat registers a machine-wide URL reservation with HTTP.SYS.
+  ; That lives in the kernel, not in $INSTDIR, so deleting this folder does
+  ; not touch it -- and a reservation with no listener behind it makes
+  ; Windows answer the port with 503 on its own. That is why uninstalling,
+  ; wiping the folder and reinstalling can all fail to fix it.
+  ;
+  ; It cannot be removed from here directly: this is a per-user install
+  ; (RequestExecutionLevel user) and netsh needs Administrator. So the work
+  ; is in teardown-lan.bat and we ask for elevation only when there is
+  ; something to remove -- .gobbonet-lan is written by setup-lan.bat, so a
+  ; user who never configured LAN access is never prompted.
+  ;--------------------------------------------------------------
+  ${If} ${FileExists} "$INSTDIR\.gobbonet-lan"
+  ${AndIf} ${FileExists} "$INSTDIR\teardown-lan.bat"
+    MessageBox MB_ICONQUESTION|MB_YESNO \
+      "Remove the LAN access rules as well?$\r$\n$\r$\n\
+setup-lan.bat added a Windows firewall rule and a port reservation. The \
+reservation is stored by Windows itself, so it is NOT removed by \
+uninstalling, and a leftover one makes that port answer with a 503 error \
+even after a fresh reinstall.$\r$\n$\r$\n\
+This needs Administrator approval." \
+      IDNO skip_lan
+    ; Wait: the script lives in $INSTDIR and this section is about to delete it.
+    ExecShellWait "runas" "$INSTDIR\teardown-lan.bat" "/quiet"
+    skip_lan:
+  ${EndIf}
+
+  ;--------------------------------------------------------------
+  ; THE USER'S OWN DATA.
+  ;
+  ; config.toml and state do NOT live under $INSTDIR. ConfigDir() and
+  ; DataDir() are XDG paths on every platform, Windows included, so the real
+  ; locations are %USERPROFILE%\.config\gobbonet and
+  ; %USERPROFILE%\.local\share\gobbonet. Deleting the install folder has
+  ; never touched either, which is why a reinstall kept finding the same
+  ; broken settings -- including a server_exe pointing at a folder that no
+  ; longer existed.
+  ;
+  ; gobbonet.exe already knows how to clear them properly (and how to ask
+  ; about models), so this offers to run it rather than reimplementing the
+  ; policy here -- and it has to run BEFORE the binary is deleted.
+  ;--------------------------------------------------------------
+  ${If} ${FileExists} "$INSTDIR\gobbonet.exe"
+    MessageBox MB_ICONQUESTION|MB_YESNO \
+      "Also remove your GobboNet settings and conversations?$\r$\n$\r$\n\
+These are stored in your user folder, not in the program folder, so they \
+are normally kept -- a reinstall picks up where you left off.$\r$\n$\r$\n\
+Choose Yes if you are uninstalling to fix a problem: settings that survive \
+an uninstall are the usual reason a reinstall behaves exactly the same way.\
+$\r$\n$\r$\nYour downloaded models are asked about separately." \
+      IDNO skip_userdata
+    nsExec::ExecToLog '"$INSTDIR\gobbonet.exe" uninstall --yes --keep-models'
+    Pop $0
+    ${If} $0 != 0
+      DetailPrint "  [WARN] could not clear user settings (exit $0)."
+      DetailPrint "         Run: gobbonet uninstall"
+    ${EndIf}
+    skip_userdata:
+  ${EndIf}
+
   ; Models are the user's property and are the expensive thing to
   ; replace, so they are left behind unless explicitly confirmed.
   ${If} ${FileExists} "$INSTDIR\models\*.gguf"
@@ -935,7 +1089,12 @@ These are large files that would have to be downloaded again." \
   Delete "$INSTDIR\*.bat"
   Delete "$INSTDIR\*.ps1"
   Delete "$INSTDIR\hardware.json"
+  Delete "$INSTDIR\models.ini"
   Delete "$INSTDIR\uninstall.exe"
+  ; Dotfiles: *.bat above does not match these, and a leftover .gobbonet-port
+  ; would outlive the install and feed a stale port to the next setup-lan.bat.
+  Delete "$INSTDIR\.gobbonet-port"
+  Delete "$INSTDIR\.gobbonet-lan"
   RMDir /r "$INSTDIR\web"
   RMDir /r "$INSTDIR\llama-cpp"
   RMDir "$INSTDIR"
