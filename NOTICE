@@ -1,0 +1,51 @@
+GobboNet
+========
+
+This distribution is licensed under the GNU Affero General Public License,
+version 3. The full text is in LICENSE.
+
+
+Copyright holders
+-----------------
+
+    Copyright (C) 2026 Elodine / GoblinCorps
+    Copyright (C) 2026 John McCardle
+
+
+Provenance of the Go server
+---------------------------
+
+The Go implementation rooted at cmd/gobbonet/ and internal/ was written by
+John McCardle and first published under the MIT licence:
+
+    repository   https://github.com/jmccardle/gobbonet
+    tag          mit-go-server   (commit 0b092f1, 22 August 2026)
+    fork point   mit-fork        (commit bc40242, ElodineOfficial/gobbonet)
+
+At the time it was written, ElodineOfficial/gobbonet was MIT-licensed; the
+relicensing to AGPL-3.0 (commit 5a2f4f1) came afterwards, on 30 August 2026.
+
+Of the Go source in the 1.7 release, 7,696 of 12,972 lines are byte-identical
+to that MIT-licensed work. Twenty of the twenty-six files common to both trees
+match at the blob level, as do go.mod and go.sum.
+
+That work remains available from its author under the MIT licence at the
+mit-go-server tag. Combining it here with AGPL-3.0 contributions means this
+combined distribution is governed by the AGPL-3.0; it does not withdraw the
+MIT grant on the original files, and it does not transfer their authorship.
+
+
+Contributions from Elodine / GoblinCorps
+----------------------------------------
+
+The 1.7 release adds, on top of the above:
+
+    internal/catalog/          the model catalogue and its remote fetch
+    internal/modelfetch/       model download, progress, free-space checks
+    internal/server/models.go  /catalog.json and /model-download
+    internal/setup/            the first-run wizard
+    internal/autostart/        the start-at-login entry
+    cmd/gobbonet/              the doctor, setup, autostart, uninstall commands
+
+together with the web UI, installer and packaging work in this release. These
+are copyright Elodine / GoblinCorps and are used here under the AGPL-3.0.
